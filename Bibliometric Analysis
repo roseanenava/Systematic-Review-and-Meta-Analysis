@@ -24,7 +24,6 @@
 #
 # =============================================================================
 
-setwd("/Users/roseanenava/Documents/- BIOINFORMATICA - USP /- GITHUB")
 
 # Packages
   library(ComplexHeatmap)
