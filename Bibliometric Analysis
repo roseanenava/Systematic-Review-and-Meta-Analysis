@@ -1,0 +1,644 @@
+# =============================================================================
+# Bibliometric Analysis
+# 
+# 
+# What this script does
+#   • Queries PubMed for yearly publication counts from 1990–2025
+#   • Generates trend plots for depression, antidepressants, immune response,
+#     neuroimmune terms, cytokines and immune-cell markers
+#   • Builds heatmaps summarizing publication frequency across selected topics
+#   • Extracts author-affiliation countries from PubMed records and creates a
+#     world map of publication distribution
+#   • Generates a keyword word cloud based on PubMed term frequencies
+#   • Saves all figures as high-resolution TIFF files for manuscript use
+#
+# How to use
+#   1) Install the required R packages listed in the setup section.
+#   2) Set your project/output directory and, if needed, adjust the PubMed queries.
+#   3) Run the script in R or RStudio.
+#   4) For the world map step, review and correct the exported country table
+#      before generating the final map.
+#
+# Notes: PubMed counts may change over time, 2025 may be incomplete, and country
+# assignments from affiliations should be manually checked before interpretation.
+#
+# =============================================================================
+
+setwd("/Users/roseanenava/Documents/- BIOINFORMATICA - USP /- GITHUB")
+
+# Packages
+  library(ComplexHeatmap)
+  library(circlize)
+  library(countrycode)
+  library(dplyr)
+  library(ggbreak)
+  library(ggforce)
+  library(ggplot2)
+  library(ggrepel)
+  library(glue)
+  library(grid)
+  library(gridExtra)
+  library(paletteer)
+  library(purrr)
+  library(readxl)
+  library(rentrez)
+  library(rnaturalearth)
+  library(rnaturalearthdata)
+  library(sf)
+  library(stringr)
+  library(tibble)
+  library(tidyr)
+  library(wordcloud)
+  library(writexl)
+  library(xml2)
+
+options(stringsAsFactors = FALSE)
+
+years <- 1990:2025
+analysis_years <- years[years != 2025]
+
+output_dir <- "outputs"
+data_dir <- "data"
+figs_dir <- "figs"
+
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(data_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(figs_dir, showWarnings = FALSE, recursive = TRUE)
+
+main_colors <- c(
+  "Depression AND Antidepressant"      = "#011C40FF",
+  "Depression AND Immune response"     = "#035AA6FF",
+  "Depression AND Neuroimmune"         = "#05AFF2FF",
+  "Antidepressant AND Immune response" = "#05C7F2FF",
+  "Antidepressant AND Neuroimmune"     = "#05DBF2FF"
+)
+
+immune_colors <- c(
+  "Cytokines"      = "#120976FF",
+  "Microglia"      = "#174D79FF",
+  "T_lymphocytes"  = "#0047ABFF",
+  "Macrophages"    = "#949BBCFF",
+  "Neutrophils"    = "#1DB4D3FF",
+  "Chemokines"     = "#A2CAEDFF",
+  "NK_cells"       = "gray",
+  "B_lymphocytes"  = "#E0D9D9"
+)
+
+# =============================================================================
+# Helper functions
+# =============================================================================
+
+safe_pubmed_count <- function(query) {
+  tryCatch(
+    rentrez::entrez_search(db = "pubmed", term = query, retmax = 0)$count,
+    error = function(e) {
+      message("PubMed query failed: ", query)
+      NA_real_
+    }
+  )
+}
+
+build_yearly_queries <- function(terms, years) {
+  tibble(year = years) |>
+    tidyr::crossing(term = names(terms)) |>
+    mutate(query = glue("{terms[term]} AND {year}[PDAT]"))
+}
+
+count_yearly_pubmed <- function(terms, years) {
+  build_yearly_queries(terms, years) |>
+    mutate(count = map_dbl(query, safe_pubmed_count)) |>
+    select(year, term, count) |>
+    pivot_wider(names_from = term, values_from = count)
+}
+
+
+save_tiff <- function(filename, width, height, res = 300, compression = "lzw", plot_expr) {
+  tiff(
+    file.path(figs_dir, filename),
+    units = "in",
+    width = width,
+    height = height,
+    res = res,
+    compression = compression
+  )
+  on.exit(dev.off(), add = TRUE)
+  force(plot_expr)
+}
+
+create_small_trend_plot <- function(data, term, color) {
+  plot_data <- data |> filter(name == term)
+  
+  ggplot(plot_data, aes(year, value, group = name)) +
+    geom_line(linewidth = 0.3, colour = color) +
+    geom_point(
+      aes(size = value),
+      shape = 21,
+      colour = "black",
+      fill = color
+    ) +
+    facet_wrap(~name, scales = "free_y") +
+    theme_minimal(base_size = 30) +
+    ylab("N. articles") +
+    xlab(NULL) +
+    theme(
+      axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+      axis.title.x = element_text(size = 25),
+      axis.title.y = element_text(size = 25),
+      legend.position = "none"
+    )
+}
+
+# =============================================================================
+# Figure 1: Temporal trends in broad depression-, immune- and neuroimmune-related terms in the PubMed-indexed literature (1990-2025)
+# =============================================================================
+
+trend_terms <- c(
+  "Depression AND Antidepressant"      = "Depression AND Antidepressant",
+  "Depression AND Immune response"     = "Depression AND Immune response",
+  "Antidepressant AND Immune response" = "Antidepressant AND Immune response",
+  "Depression AND Neuroimmune"         = "Depression AND Neuroimmune",
+  "Antidepressant AND Neuroimmune"     = "Antidepressant AND Neuroimmune"
+)
+
+trend_counts <- count_yearly_pubmed(trend_terms, years)
+
+trend_long <- trend_counts |>
+  pivot_longer(-year, names_to = "name", values_to = "value") |>
+  filter(year %in% analysis_years) |>
+  mutate(name = factor(name, levels = names(main_colors)))
+
+
+
+# Figure 1a - combined plot
+create_combined_trend_plot <- function(data, colors) {
+  ggplot(data, aes(x = year, y = value, group = name)) +
+    geom_line(aes(color = name), linewidth = 0.6) +
+    geom_point(
+      aes(size = value, fill = name),
+      shape = 21,
+      colour = "black",
+      stroke = 0.35
+    ) +
+    scale_color_manual(values = colors) +
+    scale_fill_manual(values = colors) +
+    scale_size_continuous(
+      name = "N. articles",
+      breaks = c(0, 1000, 2000, 3000)
+    ) +
+    labs(
+      x = "Year",
+      y = "N. articles",
+      color = NULL,
+      fill = NULL
+    ) +
+    theme_minimal(base_size = 16) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "right",
+      legend.box = "vertical",
+      panel.grid.minor = element_blank()
+    ) +
+    guides(
+      size = guide_legend(order = 1),
+      color = guide_legend(order = 2),
+      fill = "none"
+    )
+}
+
+combined_trend_plot <- create_combined_trend_plot(
+  data = trend_long,
+  colors = main_colors
+)
+
+save_tiff(
+  filename = "figure_1a.tiff",
+  width = 14,
+  height = 6,
+  plot_expr = {
+    print(combined_trend_plot)
+  }
+)
+
+
+# Figure 1b - faceted plots
+trend_plots <- imap(
+  main_colors,
+  ~create_small_trend_plot(trend_long, term = .y, color = .x)
+)
+
+trend_layout <- rbind(
+  c(1, 2, 3),
+  c(4, 5, NA)
+)
+
+save_tiff(
+  filename = "figure_1b.tiff",
+  width = 22,
+  height = 14,
+  plot_expr = {
+    gridExtra::grid.arrange(
+      grobs = trend_plots,
+      layout_matrix = trend_layout,
+      widths = c(1, 1, 1),
+      heights = c(1, 1)
+    )
+  }
+)
+
+
+# Figure 1c - immune terms and heatmap
+
+immune_terms <- c(
+  "Cytokines"     = "Cytokines AND depression",
+  "Microglia"     = "Microglia AND depression",
+  "T_lymphocytes" = "T lymphocytes AND depression",
+  "Macrophages"   = "Macrophages AND depression",
+  "Neutrophils"   = "Neutrophils AND depression",
+  "Chemokines"    = "Chemokines AND depression",
+  "NK_cells"      = "Natural Killer cells AND depression",
+  "B_lymphocytes" = "B lymphocytes AND depression"
+)
+
+immune_counts <- count_yearly_pubmed(immune_terms, years)
+
+immune_long <- immune_counts |>
+  pivot_longer(-year, names_to = "name", values_to = "value") |>
+  filter(year %in% analysis_years) |>
+  mutate(name = factor(name, levels = names(immune_colors)))
+
+
+heatmap_matrix <- immune_counts |>
+  column_to_rownames("year") |>
+  as.matrix() |>
+  t()
+
+heatmap_colors <- circlize::colorRamp2(
+  c(0, 10, 40, 80, 100, 150, 200, 250),
+  c(
+    "#E0D9D9", "gray", "#A2CAEDFF", "#1DB4D3FF",
+    "#949BBCFF", "#0047ABFF", "#174D79FF", "#120976FF"
+  )
+)
+
+immune_heatmap <- Heatmap(
+  heatmap_matrix,
+  cluster_columns = FALSE,
+  cluster_rows = TRUE,
+  col = heatmap_colors,
+  column_names_rot = 45,
+  column_names_gp = gpar(fontsize = 17),
+  row_names_gp = gpar(fontsize = 17),
+  name = "N. articles"
+)
+
+save_tiff(
+  filename = "figure_1c.tiff",
+  width = 15,
+  height = 5,
+  plot_expr = {
+    draw(
+      immune_heatmap,
+      heatmap_legend_side = "left",
+      annotation_legend_side = "left"
+    )
+  }
+)
+
+
+# =============================================================================
+# Figure 2: Bibliometric mapping of antidepressant–immune research in depression.
+# =============================================================================
+
+
+# Figure 2a - World map: publication distribution by author affiliation
+
+
+query_map <- "Antidepressant AND Immune response AND Cytokines AND 1990:2025[PDAT]"
+
+papers_arti <- entrez_search(
+  db = "pubmed",
+  term = query_map,
+  retmax = 10000
+)
+
+papers_arti$count
+length(papers_arti$ids)
+
+ids_maps <- papers_arti$ids
+
+batches <- split(ids_maps, ceiling(seq_along(ids_maps) / 100))
+
+
+extract_affiliation_data <- function(xml_doc) {
+  
+  articles <- xml_find_all(xml_doc, "//PubmedArticle")
+  
+  map_dfr(articles, function(article) {
+    
+    pmid <- xml_text(xml_find_first(article, ".//PMID"))
+    title <- xml_text(xml_find_first(article, ".//ArticleTitle"))
+    
+   
+    affiliation <- xml_text(xml_find_first(article, ".//AffiliationInfo/Affiliation"))
+    
+    tibble(
+      PMID = pmid,
+      Title = title,
+      affiliation = affiliation
+    )
+  })
+}
+
+result_list <- list()
+
+for (batch in batches) {
+  summaries <- entrez_fetch(
+    db = "pubmed",
+    id = batch,
+    rettype = "xml"
+  )
+  
+  xml_doc <- read_xml(summaries)
+  
+  result_list[[length(result_list) + 1]] <- extract_affiliation_data(xml_doc)
+  
+  Sys.sleep(0.5)
+}
+
+aff_df <- bind_rows(result_list) %>%
+  mutate(
+    affiliation = str_squish(affiliation),
+    affiliation = str_replace_all(affiliation, "\\.", ""),
+    affiliation = str_trim(affiliation)
+  )
+
+
+country_list <- unique(na.omit(countrycode::codelist$country.name.en))
+
+
+country_list <- unique(c(
+  country_list,
+  "USA", "U.S.A", "U.S.", "UK", "U.K.",
+  "England", "Scotland", "Wales",
+  "South Korea", "North Korea",
+  "Russia", "Iran", "Czechia", "Viet Nam",
+  "Hong Kong", "Macau"
+))
+
+escape_regex <- function(x) {
+  gsub("([][{}()+*^$|\\\\?.])", "\\\\\\1", x)
+}
+
+detect_country_from_affiliation <- function(x) {
+  if (is.na(x) || x == "") return(NA_character_)
+  
+  x_low <- str_to_lower(x)
+  
+  hits <- country_list[
+    sapply(country_list, function(cty) {
+      str_detect(x_low, fixed(str_to_lower(cty)))
+    })
+  ]
+  
+  if (length(hits) == 0) return(NA_character_)
+  
+  hits[length(hits)]
+}
+
+aff_df <- aff_df %>%
+  mutate(
+    country_raw = map_chr(affiliation, detect_country_from_affiliation)
+  )
+
+write_xlsx(aff_df, "check_countries.xlsx") # check table
+
+aff_df <- read_excel("check_countries_OK.xlsx") # Import manually checked country table
+
+unmatched_aff <- aff_df %>%
+  filter(is.na(country_raw) & !is.na(affiliation))
+
+print(unmatched_aff)
+
+
+fix_map <- c(
+  "UK" = "United Kingdom",
+  "U.K." = "United Kingdom",
+  "England" = "United Kingdom",
+  "Scotland" = "United Kingdom",
+  "Wales" = "United Kingdom",
+  "USA" = "United States",
+  "U.S.A" = "United States",
+  "U.S." = "United States",
+  "South Korea" = "Korea, Republic of",
+  "North Korea" = "Korea, Democratic People's Republic of",
+  "Russia" = "Russian Federation",
+  "Iran" = "Iran, Islamic Republic of",
+  "Czechia" = "Czech Republic",
+  "Viet Nam" = "Vietnam",
+  "Hong Kong" = "Hong Kong SAR China",
+  "Macau" = "Macao SAR China",
+  "Svislach"  = "Belarus",
+  "Budapest" = "Hungary"
+)
+
+aff_df <- aff_df %>%
+  mutate(
+    country_norm = recode(country_raw, !!!fix_map)
+  )
+
+
+aff_df <- aff_df %>%
+  mutate(
+    iso3 = countrycode(
+      country_norm,
+      origin = "country.name",
+      destination = "iso3c",
+      custom_match = c(
+        "Hong Kong SAR China" = "HKG",
+        "Macao SAR China" = "MAC",
+        "Kosovo" = "XKX"
+      )
+    )
+  )
+
+unmatched_iso <- aff_df %>%
+  filter(is.na(iso3) & !is.na(country_norm))
+
+print(unique(unmatched_iso$country_norm))
+
+countries_iso <- aff_df %>%
+  filter(!is.na(iso3)) %>%
+  count(iso3, name = "frequency")
+
+
+world_sf <- rnaturalearth::ne_countries(
+  scale = "medium",
+  returnclass = "sf"
+)
+
+world_join <- world_sf %>%
+  left_join(countries_iso, by = c("iso_a3" = "iso3"))
+
+
+world_labels <- sf::st_transform(world_join, 3857)
+pts <- sf::st_point_on_surface(world_labels)
+pts <- sf::st_transform(pts, 4326)
+coords <- sf::st_coordinates(pts)
+
+label_points <- data.frame(
+  X = coords[, 1],
+  Y = coords[, 2],
+  name = world_join$name_long,
+  frequency = world_join$frequency
+) |>
+  dplyr::filter(!is.na(frequency))
+
+pal <- rev(as.character(paletteer::paletteer_d("fishualize::Aluterus_scriptus")))
+
+p2 <- ggplot(world_join) +
+  geom_sf(
+    aes(fill = log1p(frequency)),
+    linewidth = 0.2,
+    color = "white"
+  ) +
+  scale_fill_gradientn(
+    colours = pal,
+    na.value = "lightgray"
+  ) +
+  ggrepel::geom_label_repel(
+    data = label_points,
+    aes(x = X, y = Y, label = paste0(name, ": ", frequency), alpha = 0.5),
+    size = 2.8,
+    min.segment.length = 0,
+    max.overlaps = getOption("ggrepel.max.overlaps", default = 200)
+  ) +
+  coord_sf() +
+  theme_void() +
+  theme(aspect.ratio = 0.6) +
+  labs(
+    title = "Antidepressant x Immune Response x Cytokines (1990–2025)",
+    fill = "log1p(freq)"
+  )
+
+tiff(
+  file.path(figs_dir, "figure_2a.tiff"),
+  units = "in",
+  width = 10,
+  height = 5,
+  res = 300,
+  compression = "lzw"
+)
+print(p2)
+dev.off()
+
+
+
+# Figure 2b - Word cloud: PubMed keyword frequencies
+
+keyword_terms <- tribble(
+  ~label,                         ~query_term,                                                               ~color,
+  "Antidepressant",               '"Antidepressant" OR "Antidepressants"',                                 "#011C40FF",
+  "Immune response",              '"Immune response"',                                                      "#035AA6FF",
+  "Neuroimmune",                  '"Neuroimmune" OR "Neuroimmunology" OR "Neuroimmune interaction"',      "#05AFF2FF",
+  "Cytokines",                    '"Cytokines" OR "Cytokine"',                                             "#120976FF",
+  "Microglia",                    '"Microglia" OR "Microglial"',                                           "#174D79FF",
+  "T lymphocytes",                '"T lymphocytes" OR "T cells" OR "T-cell"',                             "#0047ABFF",
+  "Macrophages",                  '"Macrophages" OR "Macrophage"',                                         "#949BBCFF",
+  "Neutrophils",                  '"Neutrophils" OR "Neutrophil"',                                         "#1DB4D3FF",
+  "Chemokines",                   '"Chemokines" OR "Chemokine"',                                           "#A2CAEDFF",
+  "Natural Killer cells",         '"Natural Killer cells" OR "NK cells" OR "Natural Killer cell"',        "gray",
+  "B lymphocytes",                '"B lymphocytes" OR "B cells" OR "B-cell"',                             "#E0D9D9",
+  "Monocytes",                    '"Monocytes" OR "Monocyte"',                                             "gray",
+  "Dendritic cells",              '"Dendritic cells" OR "Dendritic cell"',                                "gray",
+  "CD4 T cells",                  '"CD4 T cells" OR "CD4+ T cells" OR "CD4 lymphocytes"',                 "gray",
+  "CD8 T cells",                  '"CD8 T cells" OR "CD8+ T cells" OR "CD8 lymphocytes"',                 "gray",
+  "Treg",                         '"Treg" OR "Tregs" OR "Regulatory T cells"',                            "gray",
+  "Th1",                          '"Th1" OR "T helper 1"',                                                 "gray",
+  "Th2",                          '"Th2" OR "T helper 2"',                                                 "gray",
+  "Th17",                         '"Th17" OR "T helper 17"',                                               "gray",
+  "IL-1beta",                     '"IL-1beta" OR "IL-1β" OR "Interleukin-1 beta"',                        "gray",
+  "IL-6",                         '"IL-6" OR "Interleukin-6"',                                             "gray",
+  "TNF-alpha",                    '"TNF-alpha" OR "TNF-α" OR "Tumor necrosis factor-alpha"',              "gray",
+  "IFN-gamma",                    '"IFN-gamma" OR "IFN-γ" OR "Interferon-gamma"',                         "gray",
+  "IL-10",                        '"IL-10" OR "Interleukin-10"',                                           "gray",
+  "IL-4",                         '"IL-4" OR "Interleukin-4"',                                             "gray",
+  "IL-17",                        '"IL-17" OR "Interleukin-17"',                                           "gray",
+  "IL-5",                         '"IL-5" OR "Interleukin-5"',                                             "gray",
+  "IL-13",                        '"IL-13" OR "Interleukin-13"',                                           "gray",
+  "Pro-inflammatory cytokines",   '"Pro-inflammatory cytokines" OR "Proinflammatory cytokines"',           "gray",
+  "Anti-inflammatory cytokines",  '"Anti-inflammatory cytokines" OR "Antiinflammatory cytokines"',         "gray",
+  "Neuroinflammation",            '"Neuroinflammation"',                                                    "gray",
+  "Microglial activation",        '"Microglial activation"',                                                "gray",
+  "Astrocyte activation",         '"Astrocyte activation" OR "Astroglial activation"',                     "gray",
+  "Gliosis",                      '"Gliosis"',                                                              "gray",
+  "HPA axis",                     '"HPA axis" OR "Hypothalamic-pituitary-adrenal axis"',                   "gray",
+  "Cortisol",                     '"Cortisol"',                                                             "gray",
+  "NF-kB",                        '"NF-kB" OR "NF-kappa B" OR "Nuclear factor kappa B"',                  "gray",
+  "JAK-STAT",                     '"JAK-STAT" OR "JAK STAT"',                                              "gray",
+  "NLRP3 inflammasome",           '"NLRP3 inflammasome" OR "NLRP3"',                                       "gray",
+  "Oxidative stress",             '"Oxidative stress"',                                                     "gray",
+  "Synaptic plasticity",          '"Synaptic plasticity"',                                                  "gray",
+  "Neurotransmission",            '"Neurotransmission"',                                                    "gray",
+  "Glutamate",                    '"Glutamate"',                                                            "gray",
+  "GABA",                         '"GABA" OR "Gamma-aminobutyric acid"',                                  "gray",
+  "Blood-brain barrier",          '"Blood-brain barrier" OR "BBB"',                                        "gray",
+  "Excitotoxicity",               '"Excitotoxicity"',                                                       "gray"
+)
+
+
+safe_pubmed_count <- function(query) {
+  tryCatch(
+    rentrez::entrez_search(
+      db = "pubmed",
+      term = query,
+      retmax = 0
+    )$count,
+    error = function(e) {
+      message("PubMed query failed: ", query)
+      NA_real_
+    }
+  )
+}
+
+keyword_counts <- expand_grid(
+  year = years,
+  label = keyword_terms$label
+) |>
+  left_join(keyword_terms, by = "label") |>
+  mutate(
+    query = glue('depression AND ({query_term}) AND {year}[PDAT]'),
+    count = map_dbl(query, safe_pubmed_count)
+  )
+
+keyword_frequencies <- keyword_counts |>
+  group_by(label, color) |>
+  summarise(freq = sum(count, na.rm = TRUE), .groups = "drop") |>
+  arrange(desc(freq))
+
+set.seed(123)
+
+tiff(
+  file.path(figs_dir, "figure_2bb.tiff"),
+  width = 3400,
+  height = 3600,
+  res = 600,
+  compression = "lzw"
+)
+
+par(mar = c(1, 1, 1, 1))
+
+wordcloud(
+  words = keyword_frequencies$label,
+  freq = keyword_frequencies$freq,
+  scale = c(4.3, 1.1),
+  min.freq = 1,
+  max.words = nrow(keyword_frequencies),
+  random.order = FALSE,
+  rot.per = 0.10,
+  colors = keyword_frequencies$color,
+  ordered.colors = TRUE,
+  use.r.layout = TRUE
+)
+
+
+dev.off()
