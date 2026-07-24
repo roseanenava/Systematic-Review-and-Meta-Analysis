@@ -1,0 +1,869 @@
+# =============================================================================
+# Meta-analysis 
+#
+# How to use
+#   1) Keep TDM.xlsx in the same folder as this script.
+#   2) This script assumes each Excel sheet follows the column names used below.
+#   3) Install packages once using the package list below.
+#   
+# =============================================================================
+
+# Packages
+library(meta)
+library(metafor)
+library(readxl)
+library(grid)
+library(gridExtra)
+library(cowplot)
+library(writexl)
+library(dplyr)
+library(irr)
+library(clubSandwich)
+library(ggplot2)
+library(patchwork)
+library(stringr)
+library(tidyr)
+library(scales)
+library(readxl)
+
+setwd("/Users/roseanenava/Documents/- BIOINFORMATICA - USP /- GITHUB")
+
+output_dir <- "outputs"
+data_dir <- "data"
+
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(data_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create("orchards_pages", recursive = TRUE, showWarnings = FALSE)
+dir.create("orchards_signif", recursive = TRUE, showWarnings = FALSE)
+dir.create("forests_pages", recursive = TRUE, showWarnings = FALSE)
+dir.create("figs", recursive = TRUE, showWarnings = FALSE)
+dir.create("funnels", recursive = TRUE, showWarnings = FALSE)
+
+xlsx_file <- "TDM.xlsx"
+
+pval <- function(mean1, sd1, n1, mean2, sd2, n2) {
+  if (any(is.na(c(mean1, sd1, n1, mean2, sd2, n2)))) return(NA_real_)
+  se <- sqrt((sd1^2 / n1) + (sd2^2 / n2))
+  if (!is.finite(se) || se == 0) return(NA_real_)
+  t_stat <- (mean1 - mean2) / se
+  df <- ((sd1^2 / n1) + (sd2^2 / n2))^2 /
+    (((sd1^2 / n1)^2 / (n1 - 1)) + ((sd2^2 / n2)^2 / (n2 - 1)))
+  2 * stats::pt(-abs(t_stat), df = df)
+}
+
+
+# ==============================================================================
+# Reviewer agreement: Cohen's kappa
+# ==============================================================================
+
+# Kappa with 95% CI and p-value.
+# κ≈0.01–0.20: slight; 0.21–0.40: fair; 0.41–0.60: moderate; 0.61–0.80: substantial; >0.80: almost perfect.ta.
+
+df <- read_excel("TDM.xlsx", 
+                 sheet = "kappa")
+
+names(df)[names(df) == "Reviewer1...3"] <- "Reviewer1"
+
+df$Reviewer1 <- factor(df$Reviewer1, levels=c("exclude","include"))
+df$Reviewer2 <- factor(df$Reviewer2, levels=c("exclude","include"))
+kappa2(df[,c("Reviewer1","Reviewer2")])  # κ, IC, p
+
+table(df$Reviewer1, df$Reviewer2)
+kappa2(df[, c("Reviewer1", "Reviewer2")], weight = "squared")
+
+
+
+# ==============================================================================
+# Meta-analysis (package meta) 
+# ==============================================================================
+
+# Heterogeneity estimator: DerSimonian–Laird (DL), classical confidence interval, 
+# and effect size = SMD (Hedges' g).
+#
+# Interpretation:
+# SMD > 0 indicates that the “experimental” group ("MDD" or “After”) presents 
+# higher cytokine levels than the control group ("HC" or "Before").
+# SMD < 0 indicates lower levels.
+#
+# Labels (MDD vs HC; After vs Before),
+# Q, I², τ², z/p-value of the pooled effect,
+# study columns, means, SDs, sample sizes, weight, and SMD with 95% CI.
+#
+# Analyses stratified by cytokine profile groups:
+# TH1 (IFN-γ, IL-2),
+# TH2 (IL-4, IL-5, IL-10, IL-13), and
+# Others (TNF-α, IL-1β, IL-6, IL-8) were performed for both MDD × HC and AFTER × BEFORE comparisons.
+
+# ==============================================================================
+# Forest plots
+# ==============================================================================
+
+# Group 1: MDD vs HC
+settings.meta(
+  common = FALSE, random = TRUE,
+  method.tau = "DL", method.random.ci = "classic",
+  sm = "SMD"
+)
+
+mk_meta <- function(xlsx, sheet, title){
+  df <- read_excel(xlsx, sheet = sheet)
+  m <- metacont(
+    n.e = ne, mean.e = me, sd.e = sde,
+    n.c = nc, mean.c = mc, sd.c = sdc,
+    studlab = estudo,
+    data = df,
+    sm = "SMD", method.smd = "Hedges",
+    common = FALSE, random = TRUE, method.tau = "DL"
+  )
+  attr(m, "title") <- title
+  m
+}
+
+fgrob_block <- function(m, xlim_common = c(-20, 20), title_indent = 0.20) {
+  ttl <- attr(m, "title"); if (is.null(ttl)) ttl <- ""
+  g <- grid.grabExpr(
+    forest(
+      m,
+      label.e = "MDD", label.c = "HC",
+      test.overall = TRUE,        # Z e P por bloco
+      print.tau2   = TRUE,        # Tau²
+      print.pval.Q = TRUE,        # Chi² (Q) e p
+      print.I2     = TRUE,        # I²
+      
+      # Layout estilo RevMan
+      leftcols  = c("studlab","mean.e","sd.e","n.e","mean.c","sd.c","n.c"),
+      leftlabs  = c("Study","Mean","SD","Total","Mean","SD","Total"),
+      rightcols = c("w.random","effect","ci"),
+      rightlabs = c("Weight (%)","Std. Mean Difference","IV, Random, 95% CI"),
+      
+      col.square = "black",
+      col.diamond = "black",
+      col.diamond.lines = "black",
+      xlab = "",
+      xlim = xlim_common          # << escala fixa ±20
+    )
+  )
+  title_grob <- textGrob(
+    ttl,
+    gp = gpar(fontface = "bold", cex = 1.0),
+    x  = unit(title_indent, "npc"), just = "left"   # "na esquerda, mas não muito"
+  )
+  arrangeGrob(title_grob, g, heights = c(0.08, 0.92))
+}
+
+make_page <- function(xlsx_file, sheet_title_pairs, outfile,
+                      title_indent = 0.20,
+                      page_width = 20, page_height = 6,
+                      xlim_override = c(-20, 20)) {
+  
+  metas <- lapply(sheet_title_pairs, function(st) mk_meta(xlsx_file, st$sheet, st$title))
+  grobs <- lapply(metas, function(m) fgrob_block(m, xlim_common = xlim_override, title_indent = title_indent))
+  
+  pdf(outfile, width = page_width, height = page_height)
+  do.call(grid.arrange, c(grobs, ncol = 1, list(heights = rep(1/length(grobs), length(grobs)))))
+  dev.off()
+}
+
+### Analyses stratified by cytokine profile groups (Th1, Th2, and Other inflammatory cytokines)
+xlsx_file <- "TDM.xlsx"
+
+## TH1 
+sheet_title_TH1 <- list(
+  list(sheet = "MDDxHC IFN-γ", title = "IFN-gamma"),
+  list(sheet = "MDDxHC IL-2",  title = "IL-2")
+)
+
+make_page(
+  xlsx_file  = xlsx_file,
+  sheet_title_pairs = sheet_title_TH1,
+  outfile = file.path("forests_pages", "forest_TH1.pdf"),
+  title_indent = 0.20,
+  page_width  = 20,
+  page_height = 8,              # 2 blocos em 1 página
+  xlim_override = c(-20, 20)
+)
+
+## TH2 
+sheet_title_TH2 <- list(
+  list(sheet = "MDDxHC IL-4",  title = "IL-4"),
+  list(sheet = "MDDxHC IL-5",  title = "IL-5"),
+  list(sheet = "MDDxHC IL-10", title = "IL-10"),
+  list(sheet = "MDDxHC IL-13", title = "IL-13")
+)
+
+make_page(
+  xlsx_file  = xlsx_file,
+  sheet_title_pairs = sheet_title_TH2,
+  outfile = file.path("forests_pages", "forest_TH2.pdf"),
+  title_indent = 0.30,
+  page_width  = 30,
+  page_height = 15,              # 4 blocos em 1 página
+  xlim_override = c(-20, 20)
+)
+
+## Others 
+sheet_title_Others <- list(
+  list(sheet = "MDDxHC TNF-a",  title = "TNF-alpha"),
+  list(sheet = "MDDxHC IL-1B",  title = "IL-1B"),
+  list(sheet = "MDDxHC IL-6",   title = "IL-6"),
+  list(sheet = "MDDxHC IL-8",   title = "IL-8"))
+
+
+make_page(
+  xlsx_file  = xlsx_file,
+  sheet_title_pairs = sheet_title_Others,
+  outfile    = file.path("forests_pages", "forest_Others.pdf"),
+  title_indent = 0.35,
+  page_width  = 40,
+  page_height = 20,             
+  xlim_override = c(-20, 20)
+)
+
+# Group 2: After vs Before Treatment
+
+mk_sheet_list_ba <- function(markers) {
+  lapply(markers, function(mk) list(sheet = paste0("AFTERxBEFORE ", mk), title = mk))
+}
+
+fgrob_block_ba <- function(m, xlim_common = c(-20, 20), title_indent = 0.20) {
+  ttl <- attr(m, "title"); if (is.null(ttl)) ttl <- ""
+  g <- grid.grabExpr(
+    forest(
+      m,
+      label.e = "After", label.c = "Before",
+      test.overall = TRUE,
+      print.tau2   = TRUE,
+      print.pval.Q = TRUE,
+      print.I2     = TRUE,
+      leftcols  = c("studlab","mean.e","sd.e","n.e","mean.c","sd.c","n.c"),
+      leftlabs  = c("Study","Mean","SD","Total","Mean","SD","Total"),
+      rightcols = c("w.random","effect","ci"),
+      rightlabs = c("Weight (%)","Std. Mean Difference","IV, Random, 95% CI"),
+      col.square = "black",
+      col.diamond = "black",
+      col.diamond.lines = "black",
+      xlab = "",
+      xlim = xlim_common
+    )
+  )
+  title_grob <- textGrob(
+    ttl,
+    gp = gpar(fontface = "bold", cex = 1.0),
+    x  = unit(title_indent, "npc"), just = "left"
+  )
+  arrangeGrob(title_grob, g, heights = c(0.08, 0.92))
+}
+
+make_page_ba <- function(xlsx_file, sheet_title_pairs, outfile,
+                         title_indent = 0.20,
+                         page_width = 20, page_height = 6,
+                         xlim_override = c(-20, 20)) {
+  
+  metas <- lapply(sheet_title_pairs, function(st) mk_meta(xlsx_file, st$sheet, st$title))
+  grobs <- lapply(metas, function(m) fgrob_block_ba(m, xlim_common = xlim_override, title_indent = title_indent))
+  
+  pdf(outfile, width = page_width, height = page_height)
+  do.call(grid.arrange, c(grobs, ncol = 1, list(heights = rep(1/length(grobs), length(grobs)))))
+  dev.off()
+}
+
+### Analyses stratified by cytokine profile groups (Th1, Th2, and Other inflammatory cytokines)
+
+xlsx_file <- "TDM.xlsx"
+
+## Th1
+sheet_title_TH1_ba <- list(
+  list(sheet = "AFTERxBEFORE IFN-γ", title = "IFN-gamma"),
+  list(sheet = "AFTERxBEFORE IL-2",  title = "IL-2")
+)
+
+make_page_ba(
+  xlsx_file  = xlsx_file,
+  sheet_title_pairs = sheet_title_TH1_ba,
+  outfile = file.path("forests_pages", "forest_TH1_BA.pdf"),
+  title_indent = 0.20,
+  page_width  = 20,
+  page_height = 8,
+  xlim_override = c(-5, 5)
+)
+
+## Th2
+sheet_title_TH2_ba <- list(
+  list(sheet = "AFTERxBEFORE IL-4",  title = "IL-4"),
+  list(sheet = "AFTERxBEFORE IL-5",  title = "IL-5"),
+  list(sheet = "AFTERxBEFORE IL-10", title = "IL-10"),
+  list(sheet = "AFTERxBEFORE IL-13", title = "IL-13")
+)
+
+make_page_ba(
+  xlsx_file  = xlsx_file,
+  sheet_title_pairs = sheet_title_TH2_ba,
+  outfile = file.path("forests_pages", "forest_TH2_BA.pdf"),
+  title_indent = 0.30,
+  page_width  = 30,
+  page_height = 16,        
+  xlim_override = c(-20, 20)
+)
+
+## Others 
+sheet_title_Others_ba <- list(
+  list(sheet = "AFTERxBEFORE TNF-a",  title = "TNF-alpha"),
+  list(sheet = "AFTERxBEFORE IL-1B",  title = "IL-1B"),
+  list(sheet = "AFTERxBEFORE IL-6",   title = "IL-6"),
+  list(sheet = "AFTERxBEFORE IL-8",   title = "IL-8")
+)
+
+make_page_ba(
+  xlsx_file  = xlsx_file,
+  sheet_title_pairs = sheet_title_Others_ba,
+  outfile = file.path("forests_pages", "forest_Others_BA.pdf"),
+  title_indent = 0.35,
+  page_width  = 40,
+  page_height = 21,  
+  xlim_override = c(-5, 5)
+)
+
+
+# ==============================================================================
+# Funnel plots, Egger tests and summary tables
+# ==============================================================================
+
+# Group 1: MDD vs HC
+meta_ifn  <- mk_meta(xlsx_file, "MDDxHC IFN-γ", "IFN-gamma")
+meta_il2  <- mk_meta(xlsx_file, "MDDxHC IL-2",  "IL-2")
+meta_il4  <- mk_meta(xlsx_file, "MDDxHC IL-4",  "IL-4")
+meta_il5  <- mk_meta(xlsx_file, "MDDxHC IL-5",  "IL-5")
+meta_il10 <- mk_meta(xlsx_file, "MDDxHC IL-10", "IL-10")
+meta_il13 <- mk_meta(xlsx_file, "MDDxHC IL-13", "IL-13")
+meta_tnf  <- mk_meta(xlsx_file, "MDDxHC TNF-a", "TNF-alpha")   
+meta_il1  <- mk_meta(xlsx_file, "MDDxHC IL-1B", "IL-1B")       
+meta_il1b <- meta_il1                                           
+meta_il6  <- mk_meta(xlsx_file, "MDDxHC IL-6",  "IL-6")
+meta_il8  <- mk_meta(xlsx_file, "MDDxHC IL-8",  "IL-8")
+
+# Group 2: After vs Before Treatment
+meta_ifn_ba  <- mk_meta(xlsx_file, "AFTERxBEFORE IFN-γ", "IFN-gamma")
+meta_il2_ba  <- mk_meta(xlsx_file, "AFTERxBEFORE IL-2",  "IL-2")
+meta_il4_ba  <- mk_meta(xlsx_file, "AFTERxBEFORE IL-4",  "IL-4")
+meta_il5_ba  <- mk_meta(xlsx_file, "AFTERxBEFORE IL-5",  "IL-5")
+meta_il10_ba <- mk_meta(xlsx_file, "AFTERxBEFORE IL-10", "IL-10")
+meta_il13_ba <- mk_meta(xlsx_file, "AFTERxBEFORE IL-13", "IL-13")
+meta_tnf_ba  <- mk_meta(xlsx_file, "AFTERxBEFORE TNF-a", "TNF-alpha")  
+meta_il1_ba  <- mk_meta(xlsx_file, "AFTERxBEFORE IL-1B", "IL-1B")
+meta_il1b_ba <- meta_il1_ba                                           
+meta_il6_ba  <- mk_meta(xlsx_file, "AFTERxBEFORE IL-6",  "IL-6")
+meta_il8_ba  <- mk_meta(xlsx_file, "AFTERxBEFORE IL-8",  "IL-8")
+
+
+# Funnel plots
+
+# MDD vs HC: Th1
+funnel(meta_ifn, comb.fixed = FALSE)
+funnel(meta_il2, comb.fixed = FALSE)
+
+# MDD vs HC: Th2
+funnel(meta_il4, comb.fixed = FALSE)   
+funnel(meta_il5, comb.fixed = FALSE)  
+funnel(meta_il10, comb.fixed = FALSE)    
+funnel(meta_il13, comb.fixed = FALSE) 
+
+# MDD vs HC: Others
+funnel(meta_tnf, comb.fixed = FALSE)   
+funnel(meta_il1, comb.fixed = FALSE)
+funnel(meta_il6, comb.fixed = FALSE)  
+funnel(meta_il8, comb.fixed = FALSE) 
+
+
+# After vs Before: Th1
+funnel(meta_ifn_ba, comb.fixed = FALSE)
+funnel(meta_il2_ba, comb.fixed = FALSE)
+
+# After vs Before: Th2
+funnel(meta_il4_ba, comb.fixed = FALSE)   
+funnel(meta_il5_ba, comb.fixed = FALSE)  
+funnel(meta_il10_ba, comb.fixed = FALSE)    
+funnel(meta_il13_ba, comb.fixed = FALSE) 
+
+# After vs Before: Others
+funnel(meta_tnf_ba, comb.fixed = FALSE)   
+funnel(meta_il1b_ba, comb.fixed = FALSE)
+funnel(meta_il6_ba, comb.fixed = FALSE)  
+funnel(meta_il8_ba, comb.fixed = FALSE) 
+
+
+# SAVE
+pdf(file.path("funnels", "funnel_IFN_MDDxHC.pdf"), width = 6, height = 6)
+funnel(meta_ifn, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL2_MDDxHC.pdf"), width = 6, height = 6)
+funnel(meta_il2, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL4_MDDxHC.pdf"), width = 6, height = 6)
+funnel(meta_il4, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL5_MDDxHC.pdf"), width = 6, height = 6)
+funnel(meta_il5, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL10_MDDxHC.pdf"), width = 6, height = 6)
+funnel(meta_il10, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL13_MDDxHC.pdf"), width = 6, height = 6)
+funnel(meta_il13, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_TNF_MDDxHC.pdf"), width = 6, height = 6)
+funnel(meta_tnf, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL1_MDDxHC.pdf"), width = 6, height = 6)
+funnel(meta_il1, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL6_MDDxHC.pdf"), width = 6, height = 6)
+funnel(meta_il6, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL8_MDDxHC.pdf"), width = 6, height = 6)
+funnel(meta_il8, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IFN_AFTERxBEFORE.pdf"), width = 6, height = 6)
+funnel(meta_ifn_ba, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL2_AFTERxBEFORE.pdf"), width = 6, height = 6)
+funnel(meta_il2_ba, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL4_AFTERxBEFORE.pdf"), width = 6, height = 6)
+funnel(meta_il4_ba, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL5_AFTERxBEFORE.pdf"), width = 6, height = 6)
+funnel(meta_il5_ba, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL10_AFTERxBEFORE.pdf"), width = 6, height = 6)
+funnel(meta_il10_ba, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL13_AFTERxBEFORE.pdf"), width = 6, height = 6)
+funnel(meta_il13_ba, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_TNF_AFTERxBEFORE.pdf"), width = 6, height = 6)
+funnel(meta_tnf_ba, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL1B_AFTERxBEFORE.pdf"), width = 6, height = 6)
+funnel(meta_il1b_ba, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL6_AFTERxBEFORE.pdf"), width = 6, height = 6)
+funnel(meta_il6_ba, comb.fixed = FALSE)
+dev.off()
+
+pdf(file.path("funnels", "funnel_IL8_AFTERxBEFORE.pdf"), width = 6, height = 6)
+funnel(meta_il8_ba, comb.fixed = FALSE)
+dev.off()
+
+
+
+# Summary tables (Effect + I² + p + Egger)
+
+.safe_egger <- function(m) {
+  k <- sum(is.finite(m$TE))
+  if (k < 3) return(NA_real_)
+  out <- suppressWarnings(tryCatch(metabias(m, method.bias = "linreg", k.min = 3), error = function(e) NULL))
+  if (is.null(out) || is.null(out$p.value)) return(NA_real_)
+  pv <- suppressWarnings(as.numeric(out$p.value[1]))
+  if (!is.finite(pv)) NA_real_ else pv
+}
+
+.build_metas <- function(xlsx_file, sheet_title_pairs) {
+  ms <- lapply(sheet_title_pairs, function(st) {
+    m <- tryCatch(mk_meta(xlsx_file, st$sheet, st$title), error = function(e) NULL)
+    if (!is.null(m)) attr(m, "title") <- st$title
+    m
+  })
+  Filter(Negate(is.null), ms)
+}
+
+.fmt_p <- function(p) {
+  ifelse(is.na(p), "",
+         ifelse(p < 0.001, "<0.001",
+                ifelse(p < 0.01, "<0.01", sprintf("%.4f", p))))
+}
+
+.extract_summary <- function(m) {
+  data.frame(
+    Cytokines = enc2utf8(ifelse(is.null(attr(m, "title")), "", attr(m, "title"))),
+    Effect    = unname(m$TE.random),
+    CI_lower  = unname(m$lower.random),
+    CI_upper  = unname(m$upper.random),
+    I2        = unname(m$I2),                 # já em 0–100
+    p_value   = unname(m$pval.random),
+    p_egger   = .safe_egger(m),
+    sm        = m$sm,                         # "SMD" ou "MD" (para conferência)
+    stringsAsFactors = FALSE
+  )
+}
+
+make_table_from_metas <- function(metas, digits = 2) {
+  tab <- do.call(rbind, lapply(metas, .extract_summary))
+  tab <- tab[order(tab$Cytokines), ]
+  
+  eff_label <- ifelse(any(tab$sm == "MD"), "MD (Mean Difference)", "SMD (Std. Mean Difference)")
+  p <- data.frame(
+    Cytokines = tab$Cytokines,
+    check.names = FALSE
+  )
+  p[[eff_label]]        <- round(tab$Effect, digits)
+  p[["95% CI (Lower)"]] <- round(tab$CI_lower, digits)
+  p[["95% CI (Upper)"]] <- round(tab$CI_upper, digits)
+  
+  i2_vals <- tab$I2
+  if (is.finite(max(i2_vals, na.rm = TRUE)) && max(i2_vals, na.rm = TRUE) <= 1) i2_vals <- 100*i2_vals
+  p[["Heterogeneity I² (%)"]] <- ifelse(is.na(i2_vals), "", sprintf("%d%%", round(i2_vals, 0)))
+  
+  p[["P-value"]]              <- .fmt_p(tab$p_value)
+  p[["P-value Egger’s test"]] <- ifelse(is.na(tab$p_egger), "*", .fmt_p(tab$p_egger))
+  
+  list(raw = tab, p = p)
+}
+
+metas_MDD <- .build_metas(xlsx_file, c(sheet_title_TH1, sheet_title_TH2, sheet_title_Others))
+metas_BA  <- .build_metas(xlsx_file, c(sheet_title_TH1_ba, sheet_title_TH2_ba, sheet_title_Others_ba))
+
+tab_MDD <- make_table_from_metas(metas_MDD, digits = 2)
+tab_BA  <- make_table_from_metas(metas_BA,  digits = 2)
+
+# Save
+write_xlsx(list(
+  "MDDxHC_p" = tab_MDD$p,
+  "BA_p"     = tab_BA$p,
+  "MDDxHC_raw" = tab_MDD$raw,
+  "BA_raw"     = tab_BA$raw
+), file.path(output_dir, "meta_table.xlsx"))
+
+
+# ==============================================================================
+# Orchard-like plots
+# ==============================================================================
+
+pkgs <- c("readxl","dplyr","stringr","tidyr","metafor","clubSandwich",
+          "ggplot2","writexl","patchwork")
+to_install <- pkgs[!(pkgs %in% installed.packages()[,1])]
+if(length(to_install)) install.packages(to_install, dependencies = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+xlsx_file <- "TDM.xlsx"
+
+sheets_MDD <- c("MDDxHC IFN-γ","MDDxHC IL-2","MDDxHC IL-4","MDDxHC IL-5",
+                "MDDxHC IL-10","MDDxHC IL-13","MDDxHC TNF-a","MDDxHC IL-1B",
+                "MDDxHC IL-6","MDDxHC IL-8")
+
+sheets_BA  <- c("AFTERxBEFORE IFN-γ","AFTERxBEFORE IL-2","AFTERxBEFORE IL-4","AFTERxBEFORE IL-5",
+                "AFTERxBEFORE IL-10","AFTERxBEFORE IL-13","AFTERxBEFORE TNF-a","AFTERxBEFORE IL-1B",
+                "AFTERxBEFORE IL-6","AFTERxBEFORE IL-8")
+
+
+get_contrast <- function(sheet) ifelse(startsWith(sheet, "MDDxHC"), "HC_vs_MDD", "After_vs_Before")
+get_cytokine <- function(sheet){
+  nm <- sub("^MDDxHC\\s+|^AFTERxBEFORE\\s+", "", sheet)
+  nm <- dplyr::recode(nm, "TNF-a"="TNF-α", "IL-1B"="IL-1β", .default = nm)
+  nm
+}
+get_group <- function(cyt){
+  if(cyt %in% c("IFN-γ","IL-2")) return("TH1")
+  if(cyt %in% c("IL-4","IL-5","IL-10","IL-13")) return("TH2")
+  return("Others")
+}
+
+read_sheet_long <- function(sheet){
+  df <- readxl::read_excel(xlsx_file, sheet = sheet)
+  df <- df %>%
+    dplyr::rename(study_id = estudo,
+                  n_t = ne, mean_t = me, sd_t = sde,
+                  n_c = nc, mean_c = mc, sd_c = sdc) %>%
+    mutate(contrast = get_contrast(sheet),
+           cytokine = get_cytokine(sheet),
+           sheet    = sheet)
+  df
+}
+dat_long <- bind_rows(lapply(c(sheets_MDD, sheets_BA), read_sheet_long)) %>%
+  rowwise() %>%
+  mutate(group = get_group(cytokine)) %>%
+  ungroup()
+
+
+## Multilevel meta-analysis summary
+
+PAIRED_BA  <- FALSE   
+r_prepost  <- 0.5    
+
+es_all <- metafor::escalc(measure="SMDH",
+                          m1i=mean_t, sd1i=sd_t, n1i=n_t,
+                          m2i=mean_c, sd2i=sd_c, n2i=n_c,
+                          data=dat_long)
+
+if (PAIRED_BA){
+  idx <- es_all$contrast=="After_vs_Before"
+  es_smcc <- metafor::escalc(measure="SMCC",
+                             m1i=es_all$mean_t[idx], sd1i=es_all$sd_t[idx], n1i=es_all$n_t[idx],
+                             m2i=es_all$mean_c[idx], sd2i=es_all$sd_c[idx], n2i=es_all$n_c[idx],
+                             ri = r_prepost)
+  es_all$yi[idx] <- es_smcc$yi
+  es_all$vi[idx] <- es_smcc$vi
+}
+
+es_all <- es_all %>%
+  mutate(study_id = as.factor(study_id),
+         effect_id = paste0(study_id,"_", row_number()),
+         contrast  = factor(contrast, levels=c("HC_vs_MDD","After_vs_Before")),
+         cytokine  = factor(cytokine),
+         group     = factor(group, levels=c("TH1","TH2","Others")))
+
+fit_by <- function(df){
+  m <- metafor::rma.mv(yi, vi, random = ~1|study_id/effect_id, data=df, method="REML")
+  tab <- clubSandwich::coef_test(m, vcov="CR2", cluster=df$study_id)
+  data.frame(SMD = m$b[1,1],
+             SE  = sqrt(m$vb[1,1]),
+             LCL = m$b[1,1] - 1.96*sqrt(m$vb[1,1]),
+             UCL = m$b[1,1] + 1.96*sqrt(m$vb[1,1]),
+             p   = tab$p_Satt[1],
+             tau2 = sum(m$sigma2),
+             I2   = 100 * (sum(m$sigma2)/(sum(m$sigma2)+mean(df$vi))),
+             k    = nrow(df))
+}
+summ_ck <- es_all %>%
+  group_by(contrast, group, cytokine) %>%
+  group_modify(~fit_by(.x)) %>%
+  ungroup() %>%
+  arrange(contrast, group, cytokine)
+
+fmt_p <- function(p) ifelse(is.na(p),"", ifelse(p<0.001,"<0.001", ifelse(p<0.01,"<0.01", sprintf("%.4f",p))))
+tab_pretty <- summ_ck %>%
+  mutate(Contrast = ifelse(contrast=="HC_vs_MDD","MDD × HC","After × Before"),
+         `SMD (Std. Mean Difference)` = round(SMD,2),
+         `95% CI (Lower)` = round(LCL,2),
+         `95% CI (Upper)` = round(UCL,2),
+         `P-value` = fmt_p(p),
+         `Heterogeneity I² (%)` = paste0(round(pmax(0,pmin(100,I2)),0),"%")) %>%
+  select(Contrast, Group=group, Cytokines=cytokine,
+         `SMD (Std. Mean Difference)`,`95% CI (Lower)`,`95% CI (Upper)`,
+         `P-value`,`Heterogeneity I² (%)`, k, tau2)
+writexl::write_xlsx(list(
+  "Summary_by_group" = tab_pretty,
+  "Raw" = summ_ck
+), file.path(output_dir, "meta_multilevel_summary.xlsx"))
+
+## Orchard plot 
+orchard_one <- function(df, title=""){
+  if(nrow(df)<2) return(NULL)
+  m <- metafor::rma.mv(yi, vi, random=~1|study_id/effect_id, data=df, method="REML")
+  orchard::orchard_plot(m, xlab="Hedges' g (SMD)", transfm=FALSE) + ggtitle(title)
+}
+
+save_orchard_page <- function(data, the_group, the_contrast, file_pdf,
+                              ncol=2, width=10, height=8){
+  sub <- data %>% filter(group==the_group, contrast==the_contrast)
+  if(nrow(sub)==0){ message("Sem dados para ", the_group," / ", the_contrast); return(invisible(NULL)) }
+  plots <- lapply(levels(sub$cytokine), function(ck){
+    df <- sub %>% filter(cytokine==ck)
+    if(nrow(df)<2) return(NULL)
+    ttl <- paste0(as.character(ck), " — ",
+                  ifelse(the_contrast=="HC_vs_MDD","MDD vs HC","After vs Before"))
+    orchard_one(df, ttl)
+  })
+  plots <- Filter(Negate(is.null), plots)
+  if(length(plots)==0){ message("Sem plots válidos para ", the_group," / ", the_contrast); return(invisible(NULL)) }
+  nrow_grid <- ceiling(length(plots)/ncol)
+  page <- Reduce(`+`, plots) + patchwork::plot_layout(ncol=ncol, nrow=nrow_grid)
+  ggsave(file_pdf, plot=page, width=width, height=height, device=cairo_pdf)
+}
+
+dir.create("orchards_pages", showWarnings = FALSE)
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(patchwork)   
+})
+
+orchard_like_plot <- function(m, title = NULL) {
+  if (is.null(title)) title <- attr(m, "title")
+  df <- data.frame(
+    study = m$studlab,
+    TE    = m$TE,
+    se    = m$seTE
+  )
+  df$w_iv <- 1 / (df$se^2)
+  df$low  <- df$TE - 1.96 * df$se
+  df$high <- df$TE + 1.96 * df$se
+  df$study <- factor(df$study, levels = df$study[order(df$TE, decreasing = TRUE)])
+  
+  pe <- m$TE.random; lo <- m$lower.random; hi <- m$upper.random
+  pooled_row <- data.frame(
+    study = "(pooled)", TE = pe, se = NA_real_,
+    w_iv  = max(df$w_iv, na.rm = TRUE), low = lo, high = hi
+  )
+  dfp <- rbind(pooled_row, df)
+  dfp$study <- factor(dfp$study, levels = c("(pooled)", levels(df$study)))
+  
+  ggplot(dfp, aes(x = TE, y = study)) +
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4) +
+    geom_errorbarh(data = subset(dfp, study != "(pooled)"),
+                   aes(xmin = low, xmax = high), height = 0.15) +
+    geom_point(data = subset(dfp, study != "(pooled)"),
+               aes(size = w_iv), shape = 16) +
+    geom_errorbarh(data = subset(dfp, study == "(pooled)"),
+                   aes(xmin = low, xmax = high), height = 0.25, linewidth = 1) +
+    geom_point(data = subset(dfp, study == "(pooled)"),
+               shape = 23, fill = "black", color = "black", size = 3) +
+    scale_size(range = c(1.5, 5), guide = "none") +
+    labs(
+      title = title,
+      x = paste0(m$sm, " (Hedges g)"),
+      y = NULL,
+      subtitle = sprintf("Random-effects: g = %.2f (95%% CI %.2f to %.2f); I² = %d%%",
+                         pe, lo, hi, round(m$I2))
+    ) +
+    theme_bw(base_size = 10) +
+    theme(plot.title.position = "plot",
+          plot.title = element_text(face = "bold"),
+          panel.grid.major.y = element_blank())
+}
+
+save_orchard_page <- function(meta_list, titles = NULL,
+                              outfile = "orchard_page.pdf",
+                              ncol = 2, width = 10, height = 6,
+                              device = "pdf", dpi = 300) {
+  stopifnot(is.list(meta_list))
+  if (!is.null(titles) && length(titles) != length(meta_list)) {
+    stop("`titles` length must match `meta_list`.")
+  }
+  
+
+  outdir <- dirname(outfile)
+  if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  
+  plots <- Map(function(m, t) orchard_like_plot(m, t), meta_list, titles)
+  pg <- wrap_plots(plots, ncol = ncol)
+  
+  ok <- tryCatch({
+    ggsave(filename = outfile, plot = pg,
+           width = width, height = height, units = "in",
+           device = device, dpi = dpi, limitsize = FALSE)
+    TRUE
+  }, error = function(e) {
+    message("ggsave() failed: ", conditionMessage(e))
+    FALSE
+  })
+  
+  if (ok && file.exists(outfile)) {
+    message("Saved: ", normalizePath(outfile))
+  } else {
+    message("Failed to save file: ", outfile,
+            "\nTips: (1) use device='pdf'; (2) check write permissions; ",
+            "(3) avoid `cairo_pdf` unless Cairo is installed.")
+  }
+}
+
+
+# MDD vs HC: Th1
+th1_list_mddhc <- list(meta_ifn, meta_il2)
+save_orchard_page(th1_list_mddhc,
+                  titles = c("IFN-gamma (MDD × HC)", "IL-2 (MDD × HC)"),
+                  outfile = "orchards_pages/orchard_TH1_MDDxHC.pdf",
+                  ncol = 2, width = 10, height = 6, device = "pdf"
+)
+
+# MDD vs HC: Th2
+th2_list_mddhc <- list(meta_il4, meta_il5, meta_il10, meta_il13)
+save_orchard_page(th2_list_mddhc,
+                  titles = c("IL-4 (MDD × HC)", "IL-5 (MDD × HC)", "IL-10 (MDD × HC)", "IL-13 (MDD × HC)"),
+                  outfile = "orchards_pages/orchard_TH2_MDDxHC.pdf",
+                  ncol = 2, width = 12, height = 8, device = "pdf"
+)
+
+# MDD vs HC: Others
+others_list_mddhc <- list(meta_tnf, meta_il1, meta_il6, meta_il8)
+save_orchard_page(others_list_mddhc,
+                  titles = c("TNF-alfa (MDD × HC)", "IL-1 beta (MDD × HC)", "IL-6 (MDD × HC)", "IL-8 (MDD × HC)"),
+                  outfile = "orchards_pages/orchard_Others_MDDxHC.pdf",
+                  ncol = 2, width = 12, height = 8, device = "pdf"
+)
+
+#  After vs Before: Th1
+th1_list_ba <- list(meta_ifn_ba, meta_il2_ba)
+save_orchard_page(th1_list_ba,
+                  titles = c("IFN-gamma (After × Before)", "IL-2 (After × Before)"),
+                  outfile = "orchards_pages/orchard_TH1_BA.pdf",
+                  ncol = 2, width = 10, height = 6, device = "pdf"
+)
+
+
+# After vs Before: Th2
+th2_list_ba <- list(meta_il4_ba, meta_il5_ba, meta_il10_ba, meta_il13_ba)
+save_orchard_page(th2_list_ba,
+                  titles = c("IL-4 (After × Before)", "IL-5 (After × Before)", "IL-10 (After × Before)", "IL-13 (After × Before)" ),
+                  outfile = "orchards_pages/orchard_TH2_BA.pdf",
+                  ncol = 2, width = 10, height = 6, device = "pdf"
+)
+
+# After vs Before: Others
+others_list_ba <- list(meta_tnf_ba, meta_il1_ba, meta_il6_ba, meta_il8_ba)
+save_orchard_page(others_list_ba,
+                  titles = c("TNF-alfa (After × Before)", "IL-1 beta (After × Before)", "IL-6 (After × Before)", "IL-8 (After × Before)" ),
+                  outfile = "orchards_pages/orchard_others_BA.pdf",
+                  ncol = 2, width = 10, height = 6, device = "pdf"
+)
+
+
+## Orchard plot - groups
+
+
+plot_orchard_like <- function(df, title = "Summary") {
+  df <- df[order(df$Effect), ]               # order by effect
+  df$Cytokines <- factor(df$Cytokines, levels = df$Cytokines)
+  
+  ggplot(df, aes(x = Cytokines, y = Effect)) +
+    geom_point(size = 4) +
+    geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0) +
+    geom_hline(yintercept = 0, linetype = 2) +
+    coord_flip() +
+    labs(
+      x = "",
+      y = "SMD (Hedges g), random-effects [95% CI]",
+      title = title
+    ) +
+    theme_minimal()+
+    theme(
+      plot.title  = element_text(size = 26, hjust = 0.5),
+      axis.title.x = element_text(size = 22),
+      axis.text.x  = element_text(size = 22),
+      axis.text.y  = element_text(size = 22)
+    )
+}
+
+# MDD vs HC summary
+plot_orchard_like(tab_MDD$raw, "MDD vs HC")
+
+# After vs Before summary
+plot_orchard_like(tab_BA$raw, "After vs Before Treatment")
+
+
+p1 <- plot_orchard_like(tab_MDD$raw, "MDD vs HC")
+p2 <- plot_orchard_like(tab_BA$raw, "After vs Before Treatment")
+
+combined_plot <- plot_grid(p1, p2, ncol = 2, align = "hv")
+
+# Saves 
+pdf("orchards_signif/orchard_like_MDD_BA_side_by_side.pdf", width = 16, height = 6)
+print(combined_plot)
+dev.off()
